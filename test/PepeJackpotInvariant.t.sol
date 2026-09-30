@@ -11,12 +11,22 @@ import {
     JackpotTestToken,
     JackpotTestVRF,
     JackpotTestLaunchpadHook,
-    JackpotLiquidityFixture
+    JackpotLiquidityFixture,
+    JackpotForeignUnlockRelay,
+    JackpotRefundRelay
 } from "./mocks/JackpotFixtures.sol";
 
 /// @dev The manager and both pools are real v4 deployments. Only the external tokens,
 /// launchpad hook and VRF delivery are local stand-ins; no RPC is required.
+/// Oracle words arrive through three contexts the revised source must treat alike: the
+/// wrapper directly, a relay inside a foreign PoolManager.unlock, and a relay from the ETH
+/// refund of the relay's own sub-threshold trade while this contract's guard is held.
 contract PepeJackpotSequenceHandler is Test {
+    uint256 private constant RELAY_TRADE = 1 ether;
+
+    JackpotForeignUnlockRelay public immutable unlockRelay;
+    JackpotRefundRelay public immutable refundRelay;
+
     struct ExpectedTicket {
         address player;
         uint256 issuedAt;
@@ -45,6 +55,10 @@ contract PepeJackpotSequenceHandler is Test {
         wrapper = vrf;
         manager = address(game.poolManager());
         vm.deal(address(this), 1e30);
+        unlockRelay = new JackpotForeignUnlockRelay(IPoolManager(manager), vrf);
+        refundRelay = new JackpotRefundRelay(game, vrf);
+        iceToken.mint(address(refundRelay), 1e24);
+        refundRelay.approve(iceToken);
         for (uint256 i; i < actors.length; ++i) {
             address actor = vm.addr(0xCAFE + i);
             actors[i] = actor;
@@ -167,11 +181,22 @@ contract PepeJackpotSequenceHandler is Test {
     }
 
     function fulfill(uint256 ticketSeed, uint256 wordSeed, uint8 failureSeed) public {
+        _fulfill(ticketSeed, wordSeed, failureSeed, 0);
+    }
+
+    /// @dev The same word, delivered while a third party holds the manager's lock or this contract's guard.
+    function relayFulfill(uint256 ticketSeed, uint256 wordSeed, uint8 failureSeed, bool viaRefund) public {
+        _fulfill(ticketSeed, wordSeed, failureSeed, viaRefund ? 2 : 1);
+    }
+
+    function _fulfill(uint256 ticketSeed, uint256 wordSeed, uint8 failureSeed, uint8 context) private {
         if (ticketCount == 0) return;
         uint256 id = 1 + ticketSeed % ticketCount;
         ExpectedTicket storage ticket = expectedTickets[id];
         uint256 word = _randomWord(wordSeed);
         uint256 payout;
+        // The refund relay's own 1% fee on its sub-threshold sell is in the pot before the word arrives.
+        if (context == 2) contributed += RELAY_TRADE / 100;
         bool draws = ticket.status == PepeJackpot.TicketStatus.Pending && block.timestamp < ticket.issuedAt + 24 hours;
         if (draws) {
             uint256 available = contributed - paid - _totalReserved();
@@ -183,7 +208,20 @@ contract PepeJackpotSequenceHandler is Test {
         uint256 beforePlayer = ice.balanceOf(ticket.player);
         uint8 failure = failureSeed % 4;
         ice.failTransfersTo(ticket.player, failure);
-        wrapper.fulfill(id, word);
+        if (context == 0) {
+            wrapper.fulfill(id, word);
+        } else if (context == 1) {
+            unlockRelay.deliver(id, word);
+            assertTrue(unlockRelay.delivered(), "a delivery inside a foreign unlock is accepted");
+        } else {
+            uint256 beforeRelayIce = ice.balanceOf(address(refundRelay));
+            uint256 beforeRelayEth = address(refundRelay).balance;
+            refundRelay.deliverFromRefund{value: 1}(id, word);
+            assertTrue(refundRelay.attempted(), "the sub-threshold trade refunded its whole budget");
+            assertTrue(refundRelay.delivered(), "a delivery while the guard is held is accepted");
+            assertEq(ice.balanceOf(address(refundRelay)), beforeRelayIce - RELAY_TRADE, "relay paid its own trade");
+            assertEq(address(refundRelay).balance, beforeRelayEth + 1, "relay budget refunded in full");
+        }
         ice.failTransfersTo(ticket.player, 0);
 
         if (draws) {
@@ -356,7 +394,8 @@ contract PepeJackpotInvariantTest is Test {
         handler = new PepeJackpotSequenceHandler(jackpot, ice, imd, wrapper);
         handler.seed(0, 100_000 ether);
 
-        bytes4[] memory selectors = new bytes4[](11);
+        bytes4[] memory selectors = new bytes4[](12);
+        selectors[11] = handler.relayFulfill.selector;
         selectors[0] = handler.seed.selector;
         selectors[1] = handler.donate.selector;
         selectors[2] = handler.fillTank.selector;
@@ -409,6 +448,23 @@ contract PepeJackpotInvariantTest is Test {
         handler.expire(2);
         handler.fulfill(2, 0, 0);
         handler.malformedCallback(1, true, false);
+        handler.assertConservation();
+        handler.assertTickets();
+        invariant_UnlockSettlesAllCurrenciesAndRefundsSurplus();
+    }
+
+    /// @dev Relayed words pay, defer and expire exactly like direct ones; a relay cannot replay a drawn ticket.
+    function test_HandlerRelaysWordsThroughForeignUnlockAndGuardedRefund() public {
+        handler.sellIce(0, 2, 0);
+        handler.buyIce(1, 2, 0);
+        handler.throne(2, 2, 0);
+        handler.relayFulfill(0, 0, 0, false); // Jackpot paid from inside a foreign unlock.
+        handler.relayFulfill(1, 1, 3, true); // Minor prize deferred while the guard is held.
+        assertGt(handler.reserved(handler.actors(1)), 0);
+        handler.relayFulfill(0, 1, 0, true); // Replay of a drawn ticket is ignored.
+        handler.claim(1, 0);
+        handler.advanceTime(24 hours);
+        handler.relayFulfill(2, 0, 0, false); // Late relay expires, never pays.
         handler.assertConservation();
         handler.assertTickets();
         invariant_UnlockSettlesAllCurrenciesAndRefundsSurplus();

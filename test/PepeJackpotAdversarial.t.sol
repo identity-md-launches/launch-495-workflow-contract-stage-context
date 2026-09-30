@@ -68,8 +68,48 @@ contract PayoutResponseToken {
         if (behavior == 6) {
             assembly ("memory-safe") { invalid() }
         }
+        // Hand control to the recipient after crediting it, the way a hooked token would.
+        if (behavior == 7) {
+            (bool ok,) = to.call(abi.encodeWithSignature("tokenCallback()"));
+            require(ok, "recipient callback failed");
+        }
         return true;
     }
+}
+
+/// @dev A winner whose token receipt re-enters the jackpot while an oracle-initiated payout is settling.
+contract ReenteringWinner {
+    PepeJackpot public immutable jackpot;
+    bytes public reentryData;
+    uint256 public attempts;
+    bool public reentrySucceeded;
+
+    constructor(PepeJackpot game) {
+        jackpot = game;
+    }
+
+    function configure(bytes calldata data) external {
+        reentryData = data;
+    }
+
+    function approve(PayoutResponseToken token) external {
+        token.approve(address(jackpot), type(uint256).max);
+    }
+
+    function ticket() external payable returns (uint256 id) {
+        (, id) = jackpot.fridgeSwap{value: msg.value}(true, 10_000 ether, 1, block.timestamp);
+    }
+
+    function claim() external {
+        jackpot.claim();
+    }
+
+    function tokenCallback() external {
+        ++attempts;
+        (reentrySucceeded,) = address(jackpot).call(reentryData);
+    }
+
+    receive() external payable {}
 }
 
 /// @dev Tests the commitment to exactly one manager callback, without simulating any swap.
@@ -312,14 +352,82 @@ contract PepeJackpotAdversarialTest is Test {
         assertEq(ice.balanceOf(PLAYER), beforePlayer - 1);
     }
 
+    /// @dev The revision gates deliverPayout on the self-call sender alone (the guard is unset during an
+    /// oracle-initiated payout), so every foreign sender, trusted or not, is rejected at any time.
     function testTrustedAddressesCannotInvokeCallbacksOutsideActiveAction() public {
         vm.expectRevert(PepeJackpot.UnauthorizedCallback.selector);
         vm.prank(address(manager));
         jackpot.unlockCallback(abi.encode(PepeJackpot.Action.Seed, PLAYER, 0, abi.encode(uint256(1))));
-        vm.expectRevert(PepeJackpot.UnauthorizedCallback.selector);
-        vm.prank(address(jackpot));
-        jackpot.deliverPayout(PLAYER, 1);
+        address[4] memory senders = [address(manager), address(wrapper), PLAYER, address(this)];
+        for (uint256 i; i < senders.length; ++i) {
+            vm.expectRevert(PepeJackpot.UnauthorizedCallback.selector);
+            vm.prank(senders[i]);
+            jackpot.deliverPayout(PLAYER, 1);
+        }
         assertEq(jackpot.pot(), INITIAL_POT);
+        assertEq(ice.balanceOf(PLAYER), 1e27 - INITIAL_POT);
+    }
+
+    /// @dev Fulfilment holds no lock, so a winner's token callback can reach a value action mid-payout. The
+    /// exact balance check in deliverPayout then rejects the delivery, rolling the nested action back with it,
+    /// and the prize is reserved for claim: the winner only defers their own payout and nothing is lost.
+    function testValueActionReachedFromUnguardedPayoutOnlyDefersTheWinnersOwnPrize() public {
+        ReenteringWinner winner = new ReenteringWinner(jackpot);
+        ice.mint(address(winner), TRADE + 1);
+        vm.deal(address(winner), 1 ether);
+        winner.approve(ice);
+        uint256 id = winner.ticket{value: PRICE}();
+        uint256 available = jackpot.pot();
+        uint256 expected = FullMath.mulDiv(available, 9, 10);
+        winner.configure(abi.encodeCall(PepeJackpot.seed, (1)));
+        ice.configure(address(winner), 7);
+        // Mode 7 delivers and returns true, so only the nested seed shifting the pot balance can trip the
+        // exact check; the winner's own counters roll back with that frame, so the event is the witness.
+        vm.expectEmit(true, true, false, true, address(jackpot));
+        emit PepeJackpot.Drawn(id, address(winner), 77, expected, true);
+        wrapper.fulfill(id, 76);
+        _assertDrawn(id, 77, expected);
+        assertEq(winner.attempts(), 0, "the callback frame was rolled back with the rejected delivery");
+        assertEq(ice.balanceOf(address(winner)), 1, "nested seed and the payout both rolled back");
+        assertEq(jackpot.claimable(address(winner)), expected);
+        assertEq(jackpot.totalClaimable(), expected);
+        assertEq(jackpot.pot(), available - expected);
+        assertEq(ice.balanceOf(address(jackpot)), available);
+        // The reserved prize is paid in full once the token stops calling back; the guard covers the claim.
+        ice.configure(address(winner), 0);
+        winner.claim();
+        assertEq(ice.balanceOf(address(winner)), 1 + expected);
+        assertEq(jackpot.totalClaimable(), 0);
+        assertEq(jackpot.pot(), available - expected);
+        vm.expectRevert(PepeJackpot.NothingToClaim.selector);
+        winner.claim();
+    }
+
+    /// @dev A callback that tries to claim or expire while its own draw is settling finds the ticket already
+    /// terminal and no credit yet reserved, so nothing can be taken twice.
+    function testCallbackDuringPayoutCannotClaimOrExpireTheSettlingTicket() public {
+        ReenteringWinner winner = new ReenteringWinner(jackpot);
+        ice.mint(address(winner), 2 * TRADE);
+        vm.deal(address(winner), 1 ether);
+        winner.approve(ice);
+        uint256 first = winner.ticket{value: PRICE}();
+        uint256 second = winner.ticket{value: PRICE}();
+        ice.configure(address(winner), 7);
+        winner.configure(abi.encodeCall(PepeJackpot.claim, ()));
+        uint256 beforeWinner = ice.balanceOf(address(winner));
+        wrapper.fulfill(first, 19);
+        _assertDrawn(first, 20, 2_000 ether);
+        assertEq(winner.attempts(), 1);
+        assertFalse(winner.reentrySucceeded(), "no credit exists to claim during a direct payout");
+        assertEq(ice.balanceOf(address(winner)), beforeWinner + 2_000 ether, "a failed nested claim is harmless");
+        assertEq(jackpot.claimable(address(winner)), 0);
+        winner.configure(abi.encodeCall(PepeJackpot.expire, (second)));
+        wrapper.fulfill(second, 19);
+        _assertDrawn(second, 20, 2_000 ether);
+        assertFalse(winner.reentrySucceeded(), "a settling ticket is terminal before its payout");
+        assertEq(ice.balanceOf(address(winner)), beforeWinner + 4_000 ether);
+        assertEq(jackpot.totalClaimable(), 0);
+        assertEq(jackpot.pot(), INITIAL_POT + 2 * (TRADE / 100) - 4_000 ether);
     }
 
     function testSeedAndTankIntegerBoundaries() public {

@@ -1,0 +1,28 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "PepeJackpot",
+    "symbol": "PJACK",
+    "decimals": 18
+  },
+  "contracts": [
+    {
+      "contract": "PepeJackpot",
+      "constructorArgs": [
+        "0x000000000004444c5dc75cb358380d2e3de08a90",
+        "0x64914921e03069da66823f84ffcfb9931f05281a",
+        "0x51768f5da32ba2008304cc81674da51acb802888",
+        "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+        "0x02aae1a04f9828517b3007f83f6181900cad910c"
+      ]
+    }
+  ],
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "notes": "PepeJackpot uses existing Ethereum mainnet dependencies. Constructor arguments are, in order: Uniswap v4 PoolManager, ICE, LaunchpadHook, IMD, and the Chainlink VRF v2.5 direct-funding wrapper. Its five static address arguments encode the variable parts of the brief's pool keys; the implementation fixes native ETH/ICE to fee 0, tick spacing 60 and the existing hook, and native ETH/IMD to fee 10000, tick spacing 200 and no hook. PepeJackpot has no owner or initialization calls. LaunchToken has no constructor arguments; PJACK is separate from ICE and IMD and is unused by the jackpot. The manifest pool is the separate hookless native ETH/PJACK launch pool, not either existing application pool; initialPrice is decimal sqrtPriceX96. Review finding: the required launch token and protocol liquidity conflict with the approved brief's request for no new token, pool or liquidity. This conflict remains unresolved by the manifest. Policy, signed artifact linkage, source publication, admission and deployment belong to services; these notes do not authorize deployment or assert independent review approval. Mainnet dependency identities and configuration require release verification."
+}

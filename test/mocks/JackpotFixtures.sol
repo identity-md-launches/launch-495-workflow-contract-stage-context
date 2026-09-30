@@ -8,6 +8,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {PepeJackpot} from "../../src/PepeJackpot.sol";
 
 /// @dev Local test asset, deliberately able to model an ERC-20 that rejects a recipient.
 contract JackpotTestToken {
@@ -256,5 +257,59 @@ contract JackpotActor {
     receive() external payable {
         require(!rejectEther, "reject ether");
         _attempt();
+    }
+}
+
+/// @dev Relays an oracle word from inside its own PoolManager.unlock, while the manager's global lock is held.
+/// The production wrapper swallows consumer reverts; the local wrapper does not, so the relay swallows them.
+contract JackpotForeignUnlockRelay is IUnlockCallback {
+    IPoolManager public immutable manager;
+    JackpotTestVRF public immutable wrapper;
+    bool public delivered;
+
+    constructor(IPoolManager poolManager, JackpotTestVRF vrf) {
+        manager = poolManager;
+        wrapper = vrf;
+    }
+
+    function deliver(uint256 requestId, uint256 word) external {
+        manager.unlock(abi.encode(requestId, word));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager), "manager only");
+        (uint256 requestId, uint256 word) = abi.decode(data, (uint256, uint256));
+        (delivered,) = address(wrapper).call(abi.encodeCall(wrapper.fulfill, (requestId, word)));
+        return "";
+    }
+}
+
+/// @dev Relays an oracle word from the ETH refund of its own sub-threshold trade, while the jackpot's guard is held.
+contract JackpotRefundRelay {
+    PepeJackpot public immutable jackpot;
+    JackpotTestVRF public immutable wrapper;
+    uint256 private requestId;
+    uint256 private word;
+    bool public attempted;
+    bool public delivered;
+
+    constructor(PepeJackpot game, JackpotTestVRF vrf) {
+        jackpot = game;
+        wrapper = vrf;
+    }
+
+    function approve(JackpotTestToken token) external {
+        token.approve(address(jackpot), type(uint256).max);
+    }
+
+    function deliverFromRefund(uint256 id, uint256 randomWord) external payable {
+        requestId = id;
+        word = randomWord;
+        jackpot.fridgeSwap{value: msg.value}(true, 1 ether, 1, block.timestamp);
+    }
+
+    receive() external payable {
+        attempted = true;
+        (delivered,) = address(wrapper).call(abi.encodeCall(wrapper.fulfill, (requestId, word)));
     }
 }

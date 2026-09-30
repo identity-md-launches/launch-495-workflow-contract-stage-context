@@ -12,7 +12,9 @@ import {IJackpotERC20, IJackpotVRFWrapper} from "./interfaces/IJackpotTokens.sol
 import {V4ViewQuoter} from "./libraries/V4ViewQuoter.sol";
 
 /// @notice Immutable ICE jackpot and two-pool router. No administrative or rescue privileges.
-/// @dev All value actions execute in one authenticated PoolManager unlock. See README for trust assumptions.
+/// @dev Every caller-initiated value action executes in one authenticated PoolManager unlock. Oracle fulfilment
+/// only moves pot ICE, so it deliberately takes no lock: neither the manager's global lock nor this contract's
+/// guard may be held by a third party to block an authenticated delivery. See README for trust assumptions.
 contract PepeJackpot is IUnlockCallback {
     error InvalidConfiguration();
     error InvalidAmount();
@@ -70,7 +72,6 @@ contract PepeJackpot is IUnlockCallback {
         Throne,
         Seed,
         Tank,
-        Fulfill,
         Claim
     }
 
@@ -200,10 +201,13 @@ contract PepeJackpot is IUnlockCallback {
     }
 
     /// @dev Only the immutable wrapper can supply randomness. Duplicate/unknown/malformed callbacks are ignored.
-    function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external nonReentrant {
+    /// Intentionally not reentrancy-guarded and not routed through the PoolManager: the wrapper relays a proof
+    /// that anyone can submit from any context, and the draw touches no pool state. The ticket is terminal
+    /// before the payout attempt, so a delivery cannot be replayed or used to reach another value action.
+    function rawFulfillRandomWords(uint256 requestId, uint256[] calldata randomWords) external {
         if (msg.sender != address(vrfWrapper)) revert UnauthorizedCallback();
         if (tickets[requestId].status != TicketStatus.Pending || randomWords.length != 1) return;
-        _unlock(abi.encode(Action.Fulfill, address(0), 0, abi.encode(requestId, randomWords[0])));
+        _draw(requestId, randomWords[0]);
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory result) {
@@ -230,9 +234,6 @@ contract PepeJackpot is IUnlockCallback {
             }
             _pullExact(ice, player, address(this), amount);
             emit TankFilled(player, pees, amount);
-        } else if (action == Action.Fulfill) {
-            (uint256 id, uint256 word) = abi.decode(args, (uint256, uint256));
-            _draw(id, word);
         } else {
             uint256 amount = claimable[player];
             claimable[player] = 0;
@@ -336,8 +337,10 @@ contract PepeJackpot is IUnlockCallback {
     }
 
     /// @dev Isolated call makes false-return/malformed-return transfers revert their token-side state too.
+    /// The self-call in _tryPayout is this contract's only call to itself, so the sender check alone gates it;
+    /// it must not depend on the reentrancy flag, which is unset during an oracle-initiated payout.
     function deliverPayout(address player, uint256 amount) external {
-        if (msg.sender != address(this) || !entered) revert UnauthorizedCallback();
+        if (msg.sender != address(this)) revert UnauthorizedCallback();
         uint256 beforeSelf = ice.balanceOf(address(this));
         uint256 beforePlayer = ice.balanceOf(player);
         _tokenCall(address(ice), abi.encodeCall(IJackpotERC20.transfer, (player, amount)));

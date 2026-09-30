@@ -14,7 +14,9 @@ import {
     JackpotTestVRF,
     JackpotTestLaunchpadHook,
     JackpotLiquidityFixture,
-    JackpotActor
+    JackpotActor,
+    JackpotForeignUnlockRelay,
+    JackpotRefundRelay
 } from "./mocks/JackpotFixtures.sol";
 
 contract PepeJackpotTest is Test {
@@ -289,7 +291,8 @@ contract PepeJackpotTest is Test {
         uint256 ticketId = _sellTicket();
         uint256 before = ice.balanceOf(player);
         uint256 available = jackpot.pot();
-        _expectOneUnlock();
+        // Fulfilment must never depend on the manager's lock: a draw only moves pot ICE.
+        vm.expectCall(address(manager), abi.encodeWithSelector(IPoolManager.unlock.selector), 0);
         wrapper.fulfill(ticketId, 76);
         uint256 payout = available * 90 / 100;
         assertEq(ice.balanceOf(player), before + payout);
@@ -589,6 +592,59 @@ contract PepeJackpotTest is Test {
         vm.expectRevert();
         jackpot.unlockCallback("");
         assertEq(jackpot.pot(), INITIAL_POT);
+    }
+
+    /// @dev The coordinator accepts a valid proof from anyone; a relay inside a foreign unlock must still pay.
+    function test_DeliveryInsideForeignUnlockStillPays() public {
+        uint256 ticketId = _sellTicket();
+        uint256 before = ice.balanceOf(player);
+        uint256 available = jackpot.pot();
+        JackpotForeignUnlockRelay relay = new JackpotForeignUnlockRelay(IPoolManager(address(manager)), wrapper);
+        relay.deliver(ticketId, 76);
+        assertTrue(relay.delivered());
+        uint256 payout = available * 90 / 100;
+        assertEq(ice.balanceOf(player), before + payout);
+        assertEq(jackpot.pot(), available - payout);
+        _assertDrawn(ticketId, 77, payout);
+    }
+
+    /// @dev A relay from a sub-threshold trade's ETH refund, while this contract's own guard is held, must pay.
+    function test_DeliveryDuringAnotherTradesRefundStillPays() public {
+        uint256 ticketId = _sellTicket();
+        uint256 before = ice.balanceOf(player);
+        JackpotRefundRelay relay = new JackpotRefundRelay(jackpot, wrapper);
+        ice.mint(address(relay), 1 ether);
+        relay.approve(ice);
+        // The relay's own 1% fee on 1 ICE is in the pot before the draw and is part of the 90% prize.
+        uint256 available = jackpot.pot() + 0.01 ether;
+        relay.deliverFromRefund{value: 1}(ticketId, 76);
+        assertTrue(relay.attempted());
+        assertTrue(relay.delivered());
+        uint256 payout = available * 90 / 100;
+        assertEq(ice.balanceOf(player), before + payout);
+        assertEq(jackpot.pot(), available - payout);
+        _assertDrawn(ticketId, 77, payout);
+        assertEq(address(relay).balance, 1);
+    }
+
+    /// @dev The same-id replay and value-action reentry from inside a delivery remain blocked.
+    function test_DeliveryCannotReplayItselfOrStartAValueAction() public {
+        JackpotActor actor = new JackpotActor(address(jackpot));
+        ice.mint(address(actor), ICE_TRADE + 1);
+        actor.approve(ice, type(uint256).max);
+        bytes memory returned =
+            actor.execute{value: VRF_FEE}(abi.encodeCall(jackpot.fridgeSwap, (true, ICE_TRADE, 1, block.timestamp)));
+        (, uint256 ticketId) = abi.decode(returned, (uint256, uint256));
+        uint256 available = jackpot.pot();
+        actor.configure(false, true, abi.encodeCall(wrapper.fulfill, (ticketId, 76)));
+        ice.setCallback(address(actor), address(actor), abi.encodeCall(actor.tokenCallback, ()));
+        wrapper.fulfill(ticketId, 76);
+        uint256 payout = available * 90 / 100;
+        assertEq(actor.attempts(), 1);
+        assertEq(ice.balanceOf(address(actor)), 1 + payout);
+        assertEq(jackpot.pot(), available - payout);
+        assertEq(jackpot.claimable(address(actor)), 0);
+        _assertDrawn(ticketId, 77, payout);
     }
 
     function testFuzz_SellFeeAndConservation(uint128 rawAmount) public {
